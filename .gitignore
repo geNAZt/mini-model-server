@@ -1,0 +1,4 @@
+models/
+ov_env/
+hf_cache/
+.env
