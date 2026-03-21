@@ -1,0 +1,8 @@
+{
+  "gemma-3-4b-it-int4-ov": {
+    "repo_id": "OpenVINO/gemma-3-4b-it-int4-ov",
+    "local_path": "models/gemma-3-4b-it-int4-ov",
+    "description": "Gemma 3 4B IT INT4 OpenVINO model",
+    "type": "vlm"
+  }
+}

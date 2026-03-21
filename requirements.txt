@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+numpy
+openvino
+openvino-genai
+Pillow
+huggingface_hub
+python-dotenv
+mcp
+requests
