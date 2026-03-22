@@ -4,11 +4,13 @@ import queue
 import threading
 from typing import Any, Dict, List, Optional
 
+import anyio
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from mcp.server.fastmcp import FastMCP
+from starlette.concurrency import run_in_threadpool
 
 from model_manager import ModelManager
 from model_runner import ModelRunner
@@ -46,7 +48,6 @@ async def get_mcp_tools_description(mcp_instance: FastMCP) -> str:
 
         descriptions = []
         for tool in tools:
-            # Most MCP Tool objects have .name and .description
             desc = f"- {tool.name}: {tool.description or 'No description provided.'}"
             descriptions.append(desc)
         return "\n".join(descriptions)
@@ -57,15 +58,26 @@ async def get_mcp_tools_description(mcp_instance: FastMCP) -> str:
 
 @app.on_event("startup")
 async def startup_event():
-    """Download all configured models on startup."""
-    logger.info("Checking for model updates...")
-    models = model_manager.list_available_models()
-    for model_id in models:
-        logger.info(f"Ensuring model {model_id} is downloaded...")
-        try:
-            model_manager.download_model(model_id)
-        except Exception as e:
-            logger.error(f"Failed to download {model_id} on startup: {e}")
+    """Download all configured models on startup without blocking the loop."""
+
+    async def download_all():
+        logger.info("Checking for model updates...")
+        models = model_manager.list_available_models()
+        for model_id in models:
+            logger.info(f"Ensuring model {model_id} is downloaded...")
+            try:
+                await run_in_threadpool(model_manager.download_model, model_id)
+            except Exception as e:
+                logger.error(f"Failed to download {model_id} on startup: {e}")
+
+    # Kick off downloads in background task group
+    # We use a simple background task instead of full task group if we want simpler
+    # But this is safe
+    async def bg_runner():
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(download_all)
+
+    threading.Thread(target=anyio.run, args=(bg_runner,), daemon=True).start()
 
 
 # --- MCP Tools ---
@@ -89,7 +101,8 @@ async def unload_model(model_id: str) -> str:
     if not model_runner.is_loaded(model_id):
         return f"Model {model_id} is not loaded."
     try:
-        model_runner.unload_model(model_id)
+        # Unloading is fast but still better in thread if we want to be safe
+        await run_in_threadpool(model_runner.unload_model, model_id)
         return f"Model {model_id} unloaded successfully."
     except Exception as e:
         return f"Error unloading model: {str(e)}"
@@ -99,10 +112,6 @@ async def unload_model(model_id: str) -> str:
 async def load_model(model_id: str, device: str = "GPU") -> str:
     """Loads a specific model into memory. Device can be 'GPU' or 'CPU'."""
     if not model_manager.is_model_downloaded(model_id):
-        # Auto-download? For now, fail or trigger download if we want.
-        # Let's try to download if not present?
-        # Maybe too slow for a tool call without feedback.
-        # Let's check if we can download.
         return f"Error: Model {model_id} not found locally. Use download_model first."
 
     config = model_manager.list_available_models()[model_id]
@@ -110,7 +119,9 @@ async def load_model(model_id: str, device: str = "GPU") -> str:
     model_type = config.get("type", "vlm")
 
     try:
-        model_runner.load_model(model_id, model_path, device, model_type)
+        await run_in_threadpool(
+            model_runner.load_model, model_id, model_path, device, model_type
+        )
         return f"Model {model_id} loaded successfully on {device}."
     except Exception as e:
         return f"Error loading model: {str(e)}"
@@ -120,7 +131,7 @@ async def load_model(model_id: str, device: str = "GPU") -> str:
 async def download_model_tool(model_id: str) -> str:
     """Downloads a model by ID."""
     try:
-        model_manager.download_model(model_id)
+        await run_in_threadpool(model_manager.download_model, model_id)
         return f"Model {model_id} downloaded successfully."
     except Exception as e:
         return f"Error downloading model: {str(e)}"
@@ -132,8 +143,6 @@ async def generate_text(model_id: str, prompt: str, max_tokens: int = 100) -> st
     if not model_runner.is_loaded(model_id):
         return f"Error: Model {model_id} is not loaded."
 
-    # We use a queue to capture the stream for the tool output
-    # This is a blocking call for the tool, essentially.
     result_text = []
 
     def streamer(subword):
@@ -141,15 +150,8 @@ async def generate_text(model_id: str, prompt: str, max_tokens: int = 100) -> st
         return False
 
     try:
-        # Run in a thread to allow streaming logic to work (though here we collect it)
-        # Actually generate is blocking unless we thread it, but here we want to wait for result.
-        # ModelRunner.generate is synchronous (blocking) in the current implementation
-        # except for the threading used in the API endpoint.
-        # Wait, ModelRunner.generate calls pipeline.generate which IS blocking.
-        # The API endpoint uses a thread to run it and yields from a queue.
-        # Here we can just run it.
-        model_runner.generate(
-            model_id, prompt, streamer=streamer, max_new_tokens=max_tokens
+        await run_in_threadpool(
+            model_runner.generate, model_id, prompt, None, streamer, max_tokens
         )
         return "".join(result_text)
     except Exception as e:
@@ -157,20 +159,14 @@ async def generate_text(model_id: str, prompt: str, max_tokens: int = 100) -> st
 
 
 # Mount MCP
-# We assume FastMCP object is an ASGI app or has a mount method.
-# If FastMCP is an app, we can mount it.
 try:
     app.mount("/mcp", mcp)
 except Exception as e:
-    logger.error(f"Failed to mount MCP directly, trying .app or .http_app: {e}")
-    # Fallback strategies if the library version differs
+    logger.error(f"Failed to mount MCP directly: {e}")
     if hasattr(mcp, "app"):
         app.mount("/mcp", mcp.app)
     elif hasattr(mcp, "http_app"):
         app.mount("/mcp", mcp.http_app)
-    else:
-        logger.error("Could not mount MCP. Please check mcp library version.")
-
 
 # --- Standard API Endpoints ---
 
@@ -182,15 +178,7 @@ async def list_models_api():
     config = model_manager.list_available_models()
     for mid, mdata in config.items():
         models.append(
-            {
-                "id": mid,
-                "object": "model",
-                "created": 0,
-                "owned_by": "openvino",
-                "permission": [],
-                "root": mid,
-                "parent": None,
-            }
+            {"id": mid, "object": "model", "created": 0, "owned_by": "openvino"}
         )
     return {"data": models}
 
@@ -199,11 +187,11 @@ async def list_models_api():
 async def chat(request: Request):
     """OpenAI-compatible chat completion."""
     body = await request.json()
-    model_id = body.get("model", "gemma-3-4b-it-int4-ov")  # Default
+    model_id = body.get("model", "gemma-3-4b-it-int4-ov")
     messages = body.get("messages", [])
     max_tokens = body.get("max_tokens", 4096)
 
-    # Inject System Prompt for Context Awareness
+    # Context awareness system prompt
     tools_list = await get_mcp_tools_description(mcp)
     system_prompt = f"""You are the AI assistant for the 'Mini Model Server'.
 Your underlying system supports the Model Context Protocol (MCP).
@@ -212,36 +200,32 @@ When asked about your tools or MCP, you should refer to the following available 
 
 Do not confuse MCP with 'Master Control Program' or other legacy systems. You are a modern AI assistant."""
 
-    # Prepend system prompt if not present or just force it as context
-    # We'll prepend it as a system message.
     if messages and messages[0].get("role") == "system":
         messages[0]["content"] = system_prompt + "\n\n" + messages[0]["content"]
     else:
         messages.insert(0, {"role": "system", "content": system_prompt})
 
-    # Check if model is known
     config = model_manager.list_available_models()
     if model_id not in config:
         raise HTTPException(status_code=404, detail=f"Model {model_id} not found")
 
-    # Check if loaded, if not, try to load
     if not model_runner.is_loaded(model_id):
-        # Auto-load logic
         path = config[model_id]["local_path"]
         mtype = config[model_id].get("type", "vlm")
-        # Ensure downloaded
         if not model_manager.is_model_downloaded(model_id):
             raise HTTPException(
                 status_code=400, detail=f"Model {model_id} not downloaded"
             )
 
         try:
-            model_runner.load_model(model_id, path, device="GPU", model_type=mtype)
+            logger.info(f"Auto-loading model {model_id} in background thread...")
+            await run_in_threadpool(
+                model_runner.load_model, model_id, path, "GPU", mtype
+            )
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to load model: {e}")
 
     prompt, image = model_runner.extract_image_and_text(messages)
-
     logger.info(f"--- FULL PROMPT DEBUG ---\n{prompt}\n--- END PROMPT DEBUG ---")
 
     def event_generator():
@@ -253,14 +237,7 @@ Do not confuse MCP with 'Master Control Program' or other legacy systems. You ar
 
         def run_generation():
             try:
-                model_runner.generate(
-                    model_id,
-                    prompt,
-                    image=image,
-                    streamer=streamer,
-                    max_new_tokens=max_tokens,
-                )
-
+                model_runner.generate(model_id, prompt, image, streamer, max_tokens)
             except Exception as e:
                 logger.error(f"Generation error: {e}")
                 q.put(f"\n[Error: {str(e)}]")
@@ -284,39 +261,6 @@ Do not confuse MCP with 'Master Control Program' or other legacy systems. You ar
             yield f"data: {json.dumps(chunk)}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
-
-
-# --- Admin / Management Endpoints ---
-
-
-@app.post("/admin/download/{model_id}")
-async def trigger_download(model_id: str):
-    if model_id not in model_manager.list_available_models():
-        raise HTTPException(status_code=404, detail="Model ID not found in config")
-
-    # Run in background? For simplicity, synchronous for now or thread.
-    # A proper job queue would be better.
-    def download_task():
-        model_manager.download_model(model_id)
-
-    threading.Thread(target=download_task).start()
-    return {"status": "Download started in background"}
-
-
-@app.post("/admin/models")
-async def add_model_config(request: Request):
-    """Add a new model to configuration."""
-    body = await request.json()
-    model_id = body.get("model_id")
-    repo_id = body.get("repo_id")
-    local_path = body.get("local_path")
-    model_type = body.get("type", "llm")
-
-    if not all([model_id, repo_id, local_path]):
-        raise HTTPException(status_code=400, detail="Missing fields")
-
-    model_manager.add_model_config(model_id, repo_id, local_path, model_type)
-    return {"status": "Model added"}
 
 
 if __name__ == "__main__":
