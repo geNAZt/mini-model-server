@@ -99,28 +99,54 @@ class ModelRunner:
             pipeline.generate(prompt, max_new_tokens=max_new_tokens, streamer=streamer)
 
     def extract_image_and_text(self, messages):
-        """Helper to extract text and image from OpenAI chat format"""
-        prompt = ""
+        """Helper to extract conversation text and image from OpenAI chat format"""
+        full_conversation = []
         ov_image = None
+        image_found = False
 
-        last_msg = messages[-1]
-        content = last_msg.get("content")
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content")
 
-        if isinstance(content, list):
-            for item in content:
-                if item["type"] == "text":
-                    prompt = item["text"]
-                elif item["type"] == "image_url":
-                    # Base64 decode
-                    base_url = item["image_url"]["url"]
-                    base64_data = (
-                        base_url.split(",")[1] if "," in base_url else base_url
-                    )
-                    img_data = base64.b64decode(base64_data)
-                    pil_img = Image.open(io.BytesIO(img_data)).convert("RGB")
-                    image_array = np.array(pil_img)
-                    ov_image = ov.Tensor(image_array)
-        else:
-            prompt = content
+            # Text extraction
+            msg_text = ""
+            if isinstance(content, list):
+                for item in content:
+                    if item["type"] == "text":
+                        msg_text = item["text"]
+                    elif item["type"] == "image_url" and ov_image is None:
+                        # Extract image if not already found
+                        base_url = item["image_url"]["url"]
+                        base64_data = (
+                            base_url.split(",")[1] if "," in base_url else base_url
+                        )
+                        img_data = base64.b64decode(base64_data)
+                        pil_img = Image.open(io.BytesIO(img_data)).convert("RGB")
+                        image_array = np.array(pil_img)
+                        ov_image = ov.Tensor(image_array)
+                        image_found = True
+            else:
+                msg_text = content
+
+            # Format message for the prompt (simple concatenation for now)
+            # For Gemma-3 VLMs, the <image> token should be placed in the user turn.
+            if role == "system":
+                full_conversation.append(f"system\n{msg_text}")
+            elif role == "user":
+                # Inject <image> token if it's the first time we find one in a user message
+                if image_found:
+                    full_conversation.append(f"user\n<image>\n{msg_text}")
+                    image_found = False  # Only add once
+                else:
+                    full_conversation.append(f"user\n{msg_text}")
+            elif role == "assistant":
+                full_conversation.append(f"assistant\n{msg_text}")
+
+        # Join conversation with role markers
+        prompt = "\n".join(full_conversation)
+
+        # Ensure we end with 'assistant\n' for models to start generating
+        if not prompt.strip().endswith("assistant"):
+            prompt += "\nassistant\n"
 
         return prompt, ov_image
