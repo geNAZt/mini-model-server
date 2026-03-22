@@ -35,6 +35,20 @@ app.add_middleware(
 # Initialize MCP
 mcp = FastMCP("MiniModelServer")
 
+
+@app.on_event("startup")
+async def startup_event():
+    """Download all configured models on startup."""
+    logger.info("Checking for model updates...")
+    models = model_manager.list_available_models()
+    for model_id in models:
+        logger.info(f"Ensuring model {model_id} is downloaded...")
+        try:
+            model_manager.download_model(model_id)
+        except Exception as e:
+            logger.error(f"Failed to download {model_id} on startup: {e}")
+
+
 # --- MCP Tools ---
 
 
