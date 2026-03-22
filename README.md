@@ -11,17 +11,24 @@ A lightweight, OpenVINO-powered model server with MCP integration and multi-mode
 
 ## Setup
 
-1. Install dependencies:
+1. Create and activate a virtual environment (requires Python 3.10+):
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   ```
+
+2. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
 
-2. Configure models in `models.json` (optional). Default includes `gemma-3-4b-it-int4-ov`.
+3. Configure models in `models.json` (optional). Default includes `gemma-3-4b-it-int4-ov`.
 
 ## Usage
 
 ### Start the Server
 
+Ensure your virtual environment is activated:
 ```bash
 python main.py
 ```
