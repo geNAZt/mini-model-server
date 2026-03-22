@@ -36,6 +36,25 @@ app.add_middleware(
 mcp = FastMCP("MiniModelServer")
 
 
+async def get_mcp_tools_description(mcp_instance: FastMCP) -> str:
+    """Dynamically retrieves descriptions for all registered tools."""
+    try:
+        # FastMCP.list_tools() returns the registered tool objects
+        tools = await mcp_instance.list_tools()
+        if not tools:
+            return "No tools currently registered."
+
+        descriptions = []
+        for tool in tools:
+            # Most MCP Tool objects have .name and .description
+            desc = f"- {tool.name}: {tool.description or 'No description provided.'}"
+            descriptions.append(desc)
+        return "\n".join(descriptions)
+    except Exception as e:
+        logger.error(f"Error dynamically building tool list: {e}")
+        return "Error retrieving tool list."
+
+
 @app.on_event("startup")
 async def startup_event():
     """Download all configured models on startup."""
@@ -182,7 +201,23 @@ async def chat(request: Request):
     body = await request.json()
     model_id = body.get("model", "gemma-3-4b-it-int4-ov")  # Default
     messages = body.get("messages", [])
-    max_tokens = body.get("max_tokens", 1024)
+    max_tokens = body.get("max_tokens", 4096)
+
+    # Inject System Prompt for Context Awareness
+    tools_list = await get_mcp_tools_description(mcp)
+    system_prompt = f"""You are the AI assistant for the 'Mini Model Server'.
+Your underlying system supports the Model Context Protocol (MCP).
+When asked about your tools or MCP, you should refer to the following available tools:
+{tools_list}
+
+Do not confuse MCP with 'Master Control Program' or other legacy systems. You are a modern AI assistant."""
+
+    # Prepend system prompt if not present or just force it as context
+    # We'll prepend it as a system message.
+    if messages and messages[0].get("role") == "system":
+        messages[0]["content"] = system_prompt + "\n\n" + messages[0]["content"]
+    else:
+        messages.insert(0, {"role": "system", "content": system_prompt})
 
     # Check if model is known
     config = model_manager.list_available_models()
@@ -207,12 +242,7 @@ async def chat(request: Request):
 
     prompt, image = model_runner.extract_image_and_text(messages)
 
-    # Formatting logic specific to Gemma 3 or general?
-    # For now, we apply the Gemma 3 hack if it's that model and has an image.
-    # Ideally this should be in ModelRunner or a template manager.
-    formatted_prompt = prompt
-    if "gemma-3" in model_id and image is not None:
-        formatted_prompt = f"user\n<image>\n{prompt}\nassistant\n"
+    logger.info(f"--- FULL PROMPT DEBUG ---\n{prompt}\n--- END PROMPT DEBUG ---")
 
     def event_generator():
         q = queue.Queue()
@@ -225,11 +255,12 @@ async def chat(request: Request):
             try:
                 model_runner.generate(
                     model_id,
-                    formatted_prompt,
+                    prompt,
                     image=image,
                     streamer=streamer,
                     max_new_tokens=max_tokens,
                 )
+
             except Exception as e:
                 logger.error(f"Generation error: {e}")
                 q.put(f"\n[Error: {str(e)}]")
